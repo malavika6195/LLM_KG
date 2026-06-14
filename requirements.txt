@@ -2,6 +2,7 @@ langchain
 langchain-google-genai
 langchain-groq
 langchain-community
+langchain-ollama
 langgraph
 pandas
 networkx
@@ -11,3 +12,5 @@ python-dotenv
 pydantic
 tqdm
 tabulate
+PyYAML
+neo4j

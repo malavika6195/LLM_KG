@@ -1,190 +1,281 @@
 import os
-from typing import List
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_groq import ChatGroq
-from langchain_community.chat_models import ChatOllama
+import json
+import re
+import yaml
+from typing import List, Dict, Any
+try:
+    from langchain_ollama import ChatOllama
+except ImportError:
+    from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from src.agents.state import AgentState, Triple, BaseModel, Field
 from pydantic import ValidationError
-from langchain_core.runnables import Runnable
 
-class ExtractionOutput(BaseModel):
-    triples: List[Triple] = Field(description="List of medical triples extracted from text")
-
-# Mock LLM for local testing without API key
-class MockLLM(Runnable):
-    def invoke(self, input, config=None):
-        content = "Mock Strategy: Identify medical entities and their relationships."
-        return type('obj', (object,), {'content': content})
-
-    def with_structured_output(self, schema):
-        return MockStructuredLLM(schema)
-
-class MockStructuredLLM(Runnable):
-    def __init__(self, schema):
-        self.schema = schema
-    def invoke(self, inputs, config=None):
-        note = inputs.get('note', "").lower()
-        triples = []
-        if "aspirin" in note:
-            triples.append(Triple(subject="Aspirin", predicate="TREATS", obj="Pain/Inflammation", confidence=0.99))
-        if "lisinopril" in note:
-            triples.append(Triple(subject="Lisinopril", predicate="TREATS", obj="Hypertension", confidence=0.99))
-        if "infarction" in note:
-            triples.append(Triple(subject="Myocardial Infarction", predicate="DIAGNOSIS", obj="Acute", confidence=0.95))
-        if "sepsis" in note:
-            triples.append(Triple(subject="Sepsis", predicate="CONDITION", obj="Severe", confidence=0.95))
-        if "cancer" in note:
-            triples.append(Triple(subject="Breast Cancer", predicate="DIAGNOSIS", obj="Stage II", confidence=0.98))
-        if "paclitaxel" in note:
-            triples.append(Triple(subject="Paclitaxel", predicate="TREATS", obj="Breast Cancer", confidence=0.99))
-        
-        # Fallback if no keywords matched
-        if not triples:
-            triples.append(Triple(subject="Patient", predicate="EXHIBITS", obj="Clinical Symptoms", confidence=0.5))
-            
-        return type('obj', (object,), {'triples': triples})
-
-def get_llm(model_type="gemini", model_name=None):
-    """Factory to get the requested LLM. Supports Gemini, Groq, and Ollama."""
-    if os.getenv("MOCK_MODE", "false").lower() == "true":
-        return MockLLM()
+def load_domain_config(domain: str) -> Dict[str, Any]:
+    """Load domain configuration from YAML."""
+    config_path = f"src/config/domains/{domain}.yaml"
+    if not os.path.exists(config_path):
+        config_path = "src/config/domains/medical.yaml"
     
-    if model_type == "gemini":
-        name = model_name or "gemini-1.5-flash"
-        return ChatGoogleGenerativeAI(model=name, temperature=0)
-    elif model_type == "groq":
-        name = model_name or "llama-3.1-70b-versatile"
-        return ChatGroq(model=name, temperature=0)
-    elif model_type == "ollama":
+    try:
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        return {
+            "domain_name": "general",
+            "description": "General knowledge extraction",
+            "entity_types": [],
+            "allowed_predicates": [],
+            "planner_instruction": "Extract all relationships.",
+            "extractor_instruction": "Extract triples.",
+            "validator_instruction": "Validate triples."
+        }
+
+def get_llm(model_type="ollama", model_name=None):
+    """Factory to get the local Ollama LLM. External APIs removed."""
+    try:
         name = model_name or "llama3"
         return ChatOllama(model=name, temperature=0)
-    else:
-        return MockLLM()
+    except Exception as e:
+        print(f"LLM Initialization Error: {e}. Falling back to default Ollama (llama3).")
+        return ChatOllama(model="llama3", temperature=0)
 
 def planner_node(state: AgentState, config=None):
-    """Analyze the clinical note and determine the extraction focus."""
-    # Retrieve LLM from config if provided
-    llm_instance = None
-    if config:
-        llm_instance = config.get("configurable", {}).get("llm")
-    
-    # If no LLM in config, get the default
-    if not llm_instance:
-        llm_instance = get_llm()
+    """Analyze the input text and determine the extraction focus based on domain."""
+    domain_cfg = load_domain_config(state.get("domain", "medical"))
+    llm = config.get("configurable", {}).get("llm", get_llm()) if config else get_llm()
     
     prompt = ChatPromptTemplate.from_template(
-        "You are an expert medical knowledge engineer. Analyze the following clinical note.\n"
-        "1. Identify ALL medications, dosages, and routes.\n"
-        "2. Identify ALL diagnoses, symptoms, and chronic conditions.\n"
-        "3. Identify ALL procedures and lab tests mentioned.\n"
-        "4. Map the relationships between them (e.g., Drug TREATS Disease, Test DIAGNOSES Condition).\n\n"
-        "Note: {note}\n\n"
+        "You are an expert knowledge graph engineer specializing in the {domain_name} domain.\n"
+        "Domain Description: {description}\n"
+        "Instruction: {planner_instruction}\n"
+        "Entity Types: {entity_types}\n"
+        "Allowed Relations: {allowed_predicates}\n\n"
+        "Input Text: {note}\n\n"
         "Provide a detailed, structured extraction strategy to ensure maximum density of the resulting graph."
     )
-    chain = prompt | llm_instance
-    strategy = chain.invoke({"note": state["clinical_note"]})
     
-    return {
-        "planner_strategy": strategy.content,
-        "iterations": state.get("iterations", 0) + 1
-    }
+    try:
+        chain = prompt | llm
+        strategy = chain.invoke({
+            "domain_name": domain_cfg["domain_name"],
+            "description": domain_cfg["description"],
+            "planner_instruction": domain_cfg["planner_instruction"],
+            "entity_types": str(domain_cfg["entity_types"]),
+            "allowed_predicates": str(domain_cfg["allowed_predicates"]),
+            "note": state.get("input_text", "")
+        })
+        return {
+            "planner_strategy": strategy.content,
+            "iterations": state.get("iterations", 0) + 1
+        }
+    except Exception as e:
+        print(f"Planner Node Error: {e}")
+        return {"planner_strategy": "Exhaustive extraction.", "iterations": state.get("iterations", 0) + 1}
 
-import json
-import re
+def robust_json_extract(text: str) -> Any:
+    """The most robust parser for handling conversational LLM outputs."""
+    # 1. Clean common conversational hallucinations inside numeric fields (e.g. 0.8 (Inferred...))
+    text = re.sub(r'(\d+\.?\d*)\s*\([^)]*\)', r'\1', text)
+    
+    # 2. Extract potential JSON candidates
+    # Find all blocks in markdown
+    blocks = re.findall(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+    # Also consider the whole text as a candidate
+    candidates = blocks + [text]
+    
+    for cand in candidates:
+        # Find outermost braces/brackets
+        s_brace, e_brace = cand.find('{'), cand.rfind('}')
+        s_bracket, e_bracket = cand.find('['), cand.rfind(']')
+        
+        if s_brace == -1 and s_bracket == -1: continue
+        
+        # Decide which one is the actual JSON start
+        start = s_brace if (s_bracket == -1 or (s_brace != -1 and s_brace < s_bracket)) else s_bracket
+        end = e_brace if (e_bracket == -1 or (e_brace != -1 and e_brace > e_bracket)) else e_bracket
+        
+        clean = cand[start:end+1]
+        
+        # Strategy A: Standard JSON
+        try:
+            return json.loads(clean)
+        except:
+            pass
+            
+        # Strategy B: Clean common LLM formatting errors (single quotes, trailing commas)
+        try:
+            # Replace single quotes with double quotes
+            # Note: This is naive but works for simple cases. 
+            # Better to use ast.literal_eval for single-quoted structures.
+            import ast
+            return ast.literal_eval(clean)
+        except:
+            pass
+            
+        # Strategy C: Final attempt - Replace newline/tabs in strings that break JSON
+        try:
+            fixed = clean.replace('\n', ' ').replace('\r', ' ')
+            return json.loads(fixed)
+        except:
+            pass
+            
+    return None
 
 def extractor_node(state: AgentState, config=None):
-    """Extract triples from clinical text using the planner's strategy."""
-    llm_instance = None
-    if config:
-        llm_instance = config.get("configurable", {}).get("llm")
-    if not llm_instance:
-        llm_instance = get_llm()
+    """Extract triples from text using the planner's strategy and domain constraints."""
+    domain_cfg = load_domain_config(state.get("domain", "medical"))
+    llm = config.get("configurable", {}).get("llm", get_llm()) if config else get_llm()
         
     prompt = ChatPromptTemplate.from_template(
-        "You are a clinical NLP extractor. Your goal is to extract a HIGH DENSITY medical knowledge graph.\n"
-        "Use the strategy provided to pull EVERY possible Subject-Predicate-Object triple.\n\n"
+        "You are a high-precision knowledge extractor for the {domain_name} domain.\n"
+        "Goal: {extractor_instruction}\n"
         "Strategy: {strategy}\n"
-        "Note: {note}\n\n"
-        "Guidelines:\n"
-        "- Be exhaustive. Do not miss any relationships mentioned.\n"
-        "- Use standard medical terminology for nodes.\n"
-        "- Predicates should be clear and consistent (e.g., HAS_SYMPTOM, PRESCRIBED_FOR, CONTRAINDICATED_WITH).\n\n"
-        "Output MUST be a valid JSON object with a key 'triples' containing a list of objects with 'subject', 'predicate', 'obj', and 'confidence' keys.\n"
-        "Example: {{\"triples\": [{{\"subject\": \"A\", \"predicate\": \"B\", \"obj\": \"C\", \"confidence\": 1.0}}]}}\n"
-        "If this is a re-extraction, address this feedback: {feedback}\n"
+        "Input Text: {note}\n\n"
+        "Constraints:\n"
+        "- Entity Types: {entity_types}\n"
+        "- Allowed Relations: {allowed_predicates}\n\n"
+        "CRITICAL: Output MUST be a SINGLE JSON object only. NO PREAMBLE. NO APOLOGIES. NO EXPLANATIONS.\n"
+        "Format: {{'triples': [{{'subject': '...', 'predicate': '...', 'obj': '...', 'confidence': 1.0}}]}}\n"
+        "Feedback to incorporate: {feedback}\n"
     )
     
-    chain = prompt | llm_instance
-    
-    feedback = state.get("validation_feedback", "None")
-    response = chain.invoke({
-        "strategy": state["planner_strategy"],
-        "note": state["clinical_note"],
-        "feedback": feedback
-    })
-    
-    # Robust JSON parsing using Regex to find the JSON block
-    content = response.content
-    triples = []
     try:
-        # Find anything that looks like a JSON object or array
-        match = re.search(r'({.*}|\[.*\])', content, re.DOTALL)
-        if match:
-            raw_json = match.group(0)
-            data = json.loads(raw_json)
-            
-            # Handle list output directly
-            if isinstance(data, list):
-                result_list = data
-            elif isinstance(data, dict) and 'triples' in data:
-                result_list = data['triples']
-            else:
-                result_list = []
-                
+        chain = prompt | llm
+        feedback = state.get("validation_feedback") or "None"
+        response = chain.invoke({
+            "domain_name": domain_cfg["domain_name"],
+            "extractor_instruction": domain_cfg["extractor_instruction"],
+            "strategy": state.get("planner_strategy", ""),
+            "note": state.get("input_text", ""),
+            "entity_types": str(domain_cfg["entity_types"]),
+            "allowed_predicates": str(domain_cfg["allowed_predicates"]),
+            "feedback": feedback
+        })
+        
+        content = response.content
+        triples = []
+        data = robust_json_extract(content)
+        
+        if data:
+            result_list = data.get('triples', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             for t in result_list:
-                try:
-                    triples.append(Triple(**t))
-                except:
-                    continue
+                if isinstance(t, dict):
+                    # Robust field mapping
+                    s = str(t.get('subject') or 'Unknown')
+                    p = str(t.get('predicate') or 'RELATED_TO')
+                    o = str(t.get('obj') or 'Unknown')
+                    c = t.get('confidence')
+                    try:
+                        triples.append(Triple(
+                            subject=s,
+                            predicate=p,
+                            obj=o,
+                            confidence=float(c if c is not None else 1.0)
+                        ))
+                    except: pass
+                    
+        if not triples:
+            print(f"  [Debug] Parser failed to find triples in LLM output. Raw snippet: {content[:200]}...")
+            
+        return {"extracted_triples": triples}
     except Exception as e:
-        print(f"Warning: Failed to parse JSON from {model_name if 'model_name' in locals() else 'model'}: {e}")
-        print(f"Raw output was: {content[:100]}...")
-    
-    return {"extracted_triples": triples}
+        print(f"Extractor Node Error: {e}")
+        return {"extracted_triples": []}
 
 def validator_node(state: AgentState, config=None):
-    """Validate the extracted triples against logical consistency and medical truth."""
-    if os.getenv("MOCK_MODE", "false").lower() == "true":
-        return {"is_valid": True, "validation_feedback": None}
-        
-    llm_instance = None
-    if config:
-        llm_instance = config.get("configurable", {}).get("llm")
-    if not llm_instance:
-        llm_instance = get_llm()
+    """Validate extracted triples against domain constraints."""
+    domain_cfg = load_domain_config(state.get("domain", "medical"))
+    llm = config.get("configurable", {}).get("llm", get_llm()) if config else get_llm()
     
-    triples_text = "\n".join([f"{t.subject} - {t.predicate} -> {t.obj}" for t in state["extracted_triples"]])
+    extracted = state.get("extracted_triples", [])
+    if not extracted:
+        return {"is_valid": True, "validation_feedback": "Valid (empty)."}
+
+    triples_text = "\n".join([f"{t.subject} - {t.predicate} -> {t.obj}" for t in extracted])
     
     prompt = ChatPromptTemplate.from_template(
-        "You are a medical ontology validator. Evaluate these extracted triples for accuracy.\n"
-        "Triples:\n{triples}\n\n"
-        "Original Note:\n{note}\n\n"
-        "Check for:\n"
-        "1. Accuracy: Does the note actually support this relationship?\n"
-        "2. Direction: Is the relationship direction correct?\n"
-        "3. Specificity: Are the terms medically precise?\n\n"
-        "If they are excellent, reply 'PASSED'. Otherwise, provide corrective instructions for the extractor."
+        "You are a {domain_name} ontology validator.\n"
+        "Review these extracted triples: {triples}\n"
+        "Input Text: {note}\n\n"
+        "If all are grounded in text and valid, reply 'PASSED'. Otherwise provide feedback."
     )
     
-    chain = prompt | llm_instance
-    evaluation = chain.invoke({
-        "triples": triples_text,
-        "note": state["clinical_note"]
-    })
+    try:
+        chain = prompt | llm
+        evaluation = chain.invoke({
+            "domain_name": domain_cfg["domain_name"],
+            "triples": triples_text,
+            "note": state.get("input_text", "")
+        })
+        
+        is_valid = "PASSED" in evaluation.content.upper()
+        return {
+            "is_valid": is_valid,
+            "validation_feedback": None if is_valid else evaluation.content
+        }
+    except Exception as e:
+        return {"is_valid": True, "validation_feedback": None}
+
+def deduplicator_node(state: AgentState, config=None):
+    """Normalize and deduplicate entities."""
+    llm = config.get("configurable", {}).get("llm", get_llm()) if config else get_llm()
+    extracted = state.get("extracted_triples", [])
+    if not extracted:
+        return {"extracted_triples": []}
+
+    triples_text = "\n".join([f"{t.subject} - {t.predicate} -> {t.obj}" for t in extracted])
     
-    is_valid = "PASSED" in evaluation.content.upper()
-    return {
-        "is_valid": is_valid,
-        "validation_feedback": None if is_valid else evaluation.content
-    }
+    prompt = ChatPromptTemplate.from_template(
+        "Normalize entity names in these triples for consistency: {triples}\n"
+        "Output the cleaned triples as JSON with key 'triples'."
+    )
+    
+    try:
+        chain = prompt | llm
+        response = chain.invoke({"triples": triples_text})
+        data = robust_json_extract(response.content)
+        
+        cleaned_triples = []
+        if data:
+            result_list = data.get('triples', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            for t in result_list:
+                if isinstance(t, dict):
+                    s = str(t.get('subject') or 'Unknown')
+                    p = str(t.get('predicate') or 'RELATED_TO')
+                    o = str(t.get('obj') or 'Unknown')
+                    c = t.get('confidence')
+                    try:
+                        cleaned_triples.append(Triple(
+                            subject=s,
+                            predicate=p,
+                            obj=o,
+                            confidence=float(c if c is not None else 1.0)
+                        ))
+                    except: pass
+        
+        return {"extracted_triples": cleaned_triples if cleaned_triples else extracted}
+    except Exception as e:
+        return {"extracted_triples": extracted}
+
+from langchain_community.graphs import Neo4jGraph
+from langchain_community.chains.graph_qa.cypher import GraphCypherQAChain
+
+def query_node(state: AgentState, config=None):
+    """Query the Neo4j graph."""
+    llm = config.get("configurable", {}).get("llm", get_llm()) if config else get_llm()
+    query = state.get("query")
+    if not query: return {"answer": "No query provided."}
+    
+    try:
+        graph = Neo4jGraph(
+            url=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+            username=os.getenv("NEO4J_USER", "neo4j"),
+            password=os.getenv("NEO4J_PASSWORD", "password")
+        )
+        chain = GraphCypherQAChain.from_llm(llm=llm, graph=graph, verbose=True, allow_dangerous_requests=True)
+        response = chain.invoke({"query": query})
+        return {"answer": response.get("result", "I couldn't find an answer.")}
+    except Exception as e:
+        return {"answer": f"Error: {str(e)}"}
